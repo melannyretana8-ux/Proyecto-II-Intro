@@ -1,4 +1,13 @@
 
+import pygame
+import random
+import json
+import os
+import math
+from enum import Enum
+from collections import deque
+from typing import List, Tuple, Optional
+
 # ============================================================================
 # CONFIGURACIÓN Y CONSTANTES
 # ============================================================================
@@ -240,7 +249,7 @@ class Player:
         self.move_cooldown = 0  # Cooldown para movimiento discreto
         self.last_move_time = 0
     
-    def update(self, keys, map_grid: List[List[Tile]], current_time: int):
+    def update(self, keys, map_grid: List[List[Tile]], current_time: int, game_mode: GameMode = None):
         """Actualiza la posición del jugador con movimiento discreto (sin diagonales)"""
         if not self.alive:
             return
@@ -248,8 +257,13 @@ class Player:
         # Movimiento discreto: solo una dirección a la vez, sin diagonales
         move_delay = 150  # Milisegundos entre movimientos (más rápido si corre)
         is_running = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+        
+        # Verificar si tiene energía para correr
         if is_running and self.energy > 0:
             move_delay = 100  # Movimiento más rápido al correr
+        elif is_running and self.energy <= 0:
+            # No puede correr sin energía, usar velocidad normal
+            is_running = False
         
         # Verificar si puede moverse (cooldown)
         if current_time - self.last_move_time < move_delay:
@@ -291,16 +305,27 @@ class Player:
         
         # Verificar colisión con el mapa
         rows, cols = len(map_grid), len(map_grid[0])
-        if (0 <= new_row < rows and 0 <= new_col < cols and 
-            map_grid[new_row][new_col].can_player_pass()):
-            # Movimiento válido: actualizar posición
-            self.row = new_row
-            self.col = new_col
-            self.x = new_col * TILE_SIZE + MAP_OFFSET_X
-            self.y = new_row * TILE_SIZE + MAP_OFFSET_Y
-            self.last_move_time = current_time
+        if 0 <= new_row < rows and 0 <= new_col < cols:
+            tile = map_grid[new_row][new_col]
+            # En modo Cazador: puede usar lianas pero NO túneles
+            # En modo Escapa: puede usar túneles pero NO lianas
+            can_pass = False
+            if game_mode == GameMode.CAZADOR:
+                # Modo Cazador: Camino y Lianas (NO túneles)
+                can_pass = tile.tile_type in [TileType.CAMINO, TileType.LIANAS]
+            else:
+                # Modo Escapa: Camino y Túneles (NO lianas)
+                can_pass = tile.tile_type in [TileType.CAMINO, TileType.TUNEL]
+            
+            if can_pass:
+                # Movimiento válido: actualizar posición
+                self.row = new_row
+                self.col = new_col
+                self.x = new_col * TILE_SIZE + MAP_OFFSET_X
+                self.y = new_row * TILE_SIZE + MAP_OFFSET_Y
+                self.last_move_time = current_time
     
-    def place_trap(self, current_time: int, map_grid: List[List[Tile]]) -> bool:
+    def place_trap(self, current_time: int, map_grid: List[List[Tile]], game_mode: GameMode = None) -> bool:
         """Coloca una trampa si es posible"""
         # Verificar cooldown
         if current_time - self.last_trap_time < TRAP_COOLDOWN:
@@ -311,8 +336,17 @@ class Player:
         if len(active_traps) >= MAX_TRAPS:
             return False
         
-        # Verificar que la casilla sea válida (no muro)
-        if not map_grid[self.row][self.col].can_player_pass():
+        # Verificar que la casilla sea válida según el modo
+        tile = map_grid[self.row][self.col]
+        can_place = False
+        if game_mode == GameMode.CAZADOR:
+            # Modo Cazador: puede colocar en Camino y Lianas
+            can_place = tile.tile_type in [TileType.CAMINO, TileType.LIANAS]
+        else:
+            # Modo Escapa: puede colocar en Camino y Túneles
+            can_place = tile.tile_type in [TileType.CAMINO, TileType.TUNEL]
+        
+        if not can_place:
             return False
         
         # Verificar que no haya otra trampa en la misma posición
@@ -343,218 +377,9 @@ class Player:
 # ENEMIGO
 # ============================================================================
 
-class Enemy:
-    """Clase que representa un enemigo"""
-    
-    def __init__(self, start_row: int, start_col: int, map_grid: List[List[Tile]]):
-        self.row = start_row
-        self.col = start_col
-        self.x = start_col * TILE_SIZE + MAP_OFFSET_X
-        self.y = start_row * TILE_SIZE + MAP_OFFSET_Y
-        self.path = []
-        self.last_path_update = 0
-        self.map_grid = map_grid
-        self.alive = True
-        self.death_time = 0  # Tiempo cuando murió (para respawn)
-    
-    def update(self, target_pos: Tuple[int, int], current_time: int, 
-               mode: GameMode, map_grid: List[List[Tile]]):
-        """Actualiza la posición del enemigo usando pathfinding"""
-        if not self.alive:
-            return
-        
-        self.map_grid = map_grid
-        
-        # Actualizar pathfinding periódicamente
-        if current_time - self.last_path_update > ENEMY_PATHFIND_UPDATE:
-            current_grid_pos = (self.row, self.col)
-            
-            if mode == GameMode.ESCAPA:
-                # Perseguir al jugador
-                self.path = Pathfinder.astar(map_grid, current_grid_pos, target_pos, for_enemy=True)
-            else:  # CAZADOR
-                # Huir del jugador (buscar posición aleatoria lejos)
-                rows, cols = len(map_grid), len(map_grid[0])
-                # Intentar moverse hacia la salida o alejarse
-                flee_target = self._find_flee_target(target_pos, rows, cols)
-                self.path = Pathfinder.astar(map_grid, current_grid_pos, flee_target, for_enemy=True)
-            
-            self.last_path_update = current_time
-        
-        # Seguir el camino
-        if self.path and len(self.path) > 1:
-            next_pos = self.path[1]
-            target_x = next_pos[1] * TILE_SIZE + MAP_OFFSET_X
-            target_y = next_pos[0] * TILE_SIZE + MAP_OFFSET_Y
-            
-            # Movimiento suave hacia el siguiente nodo
-            dx = target_x - self.x
-            dy = target_y - self.y
-            distance = math.sqrt(dx*dx + dy*dy)
-            
-            if distance > 2:
-                self.x += (dx / distance) * ENEMY_SPEED
-                self.y += (dy / distance) * ENEMY_SPEED
-            else:
-                self.x = target_x
-                self.y = target_y
-                self.path.pop(0)
-            
-            # Actualizar posición en grid
-            self.row = int((self.y - MAP_OFFSET_Y) / TILE_SIZE)
-            self.col = int((self.x - MAP_OFFSET_X) / TILE_SIZE)
-    
-    def _find_flee_target(self, player_pos: Tuple[int, int], rows: int, cols: int) -> Tuple[int, int]:
-        """Encuentra un objetivo para huir del jugador"""
-        # Buscar posición en el borde opuesto
-        candidates = []
-        for r in [1, rows - 2]:
-            for c in range(1, cols - 1):
-                if self.map_grid[r][c].can_enemy_pass():
-                    dist = abs(r - player_pos[0]) + abs(c - player_pos[1])
-                    candidates.append(((r, c), dist))
-        
-        for c in [1, cols - 2]:
-            for r in range(1, rows - 1):
-                if self.map_grid[r][c].can_enemy_pass():
-                    dist = abs(r - player_pos[0]) + abs(c - player_pos[1])
-                    candidates.append(((r, c), dist))
-        
-        if candidates:
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            return candidates[0][0]
-        
-        return (rows - 2, cols - 2)  # Fallback
-    
-    def check_collision_with_player(self, player_row: int, player_col: int) -> bool:
-        """Verifica si el enemigo colisiona con el jugador"""
-        return self.row == player_row and self.col == player_col
-    
-    def check_trap_collision(self, trap: Trap) -> bool:
-        """Verifica si el enemigo colisiona con una trampa"""
-        return self.row == trap.row and self.col == trap.col
+
 
 # ============================================================================
 # JUEGO PRINCIPAL
 # ============================================================================
 
-class Game:
-    """Clase principal del juego"""
-    
-    def __init__(self):
-        pygame.init()
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-        pygame.display.set_caption("Juego - Escapa y Cazador")
-        self.clock = pygame.time.Clock()
-        self.font = pygame.font.Font(None, 36)
-        self.small_font = pygame.font.Font(None, 24)
-        self.state = GameState.MENU
-        self.mode = None
-        self.player_name = ""
-        self.name_input = ""
-        self.map_grid = []
-        self.player = None
-        self.enemies = []
-        self.start_pos = None
-        self.exit_pos = None
-        self.score_manager = ScoreManager()
-        self.start_time = 0
-        self.game_over = False
-        self.game_over_reason = ""
-        self.enemies_captured = 0  # Contador de enemigos capturados en modo Cazador
-        self.enemies_escaped = 0  # Contador de enemigos que escaparon en modo Cazador
-        self.paused_time_offset = 0  # Offset de tiempo cuando se pausa
-        self.pause_start_time = 0  # Tiempo cuando se inició la pausa
-    
-    def run(self):
-        """Bucle principal del juego"""
-        running = True
-        
-        while running:
-            dt = self.clock.tick(FPS)
-            current_time = pygame.time.get_ticks()
-            
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                
-                self.handle_event(event, current_time)
-            
-            self.update(current_time)
-            self.draw()
-        
-        pygame.quit()
-      
-      def handle_event(self, event: pygame.event.Event, current_time: int):
-        """Maneja eventos de entrada"""
-        if event.type == pygame.KEYDOWN:
-            if self.state == GameState.NAME_INPUT:
-                if event.key == pygame.K_RETURN:
-                    if self.name_input.strip():
-                        self.player_name = self.name_input.strip()
-                        self.state = GameState.MODE_SELECT
-                        self.name_input = ""
-                elif event.key == pygame.K_BACKSPACE:
-                    self.name_input = self.name_input[:-1]
-                else:
-                    if len(self.name_input) < 20:
-                        self.name_input += event.unicode
-            
-            elif self.state == GameState.MODE_SELECT:
-                if event.key == pygame.K_1:
-                    self.start_game(GameMode.ESCAPA)
-                elif event.key == pygame.K_2:
-                    self.start_game(GameMode.CAZADOR)
-                elif event.key == pygame.K_ESCAPE:
-                    self.state = GameState.NAME_INPUT
-                    self.name_input = ""
-            
-            elif self.state == GameState.PLAYING:
-                if event.key == pygame.K_SPACE:
-                    # Usar tiempo ajustado para las trampas
-                    adjusted_time = current_time - self.paused_time_offset
-                    self.player.place_trap(adjusted_time, self.map_grid)
-                elif event.key == pygame.K_e and self.mode == GameMode.CAZADOR:
-                    # Intentar atrapar enemigo cercano en modo Cazador
-                    self.try_capture_enemy()
-                elif event.key == pygame.K_ESCAPE:
-                    # Pausar y mostrar confirmación de salida
-                    self.pause_start_time = current_time
-                    self.state = GameState.EXIT_CONFIRM
-            
-            elif self.state == GameState.EXIT_CONFIRM:
-                if event.key == pygame.K_y or event.key == pygame.K_RETURN:
-                    # Confirmar salida
-                    self.state = GameState.MENU
-                    self.reset_game()
-                elif event.key == pygame.K_n or event.key == pygame.K_ESCAPE:
-                    # Cancelar y reanudar
-                    self.paused_time_offset += current_time - self.pause_start_time
-                    self.state = GameState.PLAYING
-            
-            elif self.state == GameState.PAUSED:
-                if event.key == pygame.K_ESCAPE or event.key == pygame.K_RETURN:
-                    # Reanudar juego
-                    self.paused_time_offset += current_time - self.pause_start_time
-                    self.state = GameState.PLAYING
-            
-            elif self.state == GameState.GAME_OVER:
-                if event.key == pygame.K_RETURN:
-                    self.state = GameState.MENU
-                    self.reset_game()
-                elif event.key == pygame.K_h:
-                    self.state = GameState.HIGH_SCORES
-            
-            elif self.state == GameState.HIGH_SCORES:
-                if event.key == pygame.K_ESCAPE or event.key == pygame.K_RETURN:
-                    self.state = GameState.MENU
-            
-            elif self.state == GameState.MENU:
-                if event.key == pygame.K_RETURN:
-                    self.state = GameState.NAME_INPUT
-                    self.name_input = ""
-                elif event.key == pygame.K_h:
-                    self.state = GameState.HIGH_SCORES
-
-
-          
