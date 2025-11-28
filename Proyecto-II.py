@@ -921,6 +921,814 @@ class Game:
                         self.pause_start_time = current_time
                         self.state = GameState.EXIT_CONFIRM
 
+    def start_game(self, mode: GameMode):
+        """Inicia una nueva partida"""
+        self.mode = mode
+        self.map_grid, self.start_pos, self.exit_pos, self.tunnel_positions = MapGenerator.generate_map(MAP_ROWS, MAP_COLS)
+        
+        # Crea jugador
+        self.player = Player(self.start_pos[0], self.start_pos[1])
+        
+        # Crea enemigos en posiciones aleatorias válidas
+        self.enemies = []
+        rows, cols = len(self.map_grid), len(self.map_grid[0])
+        enemy_positions = set()
+        
+        for _ in range(ENEMY_COUNT):
+            attempts = 0
+            while attempts < 100:
+                r = random.randint(1, rows - 2)
+                c = random.randint(1, cols - 2)
+                
+                tile = self.map_grid[r][c]
+                # En modo Cazador: enemigos pueden usar túneles también
+                can_pass = (tile.tile_type in [TileType.CAMINO, TileType.LIANAS, TileType.TUNEL] 
+                           if self.mode == GameMode.CAZADOR 
+                           else tile.tile_type in [TileType.CAMINO, TileType.LIANAS])
+                if ((r, c) not in enemy_positions and 
+                    (r, c) != self.start_pos and 
+                    (r, c) != self.exit_pos and
+                    can_pass):
+                    enemy = Enemy(r, c, self.map_grid)
+                    self.enemies.append(enemy)
+                    enemy_positions.add((r, c))
+                    break
+                attempts += 1
+        
+        self.start_time = pygame.time.get_ticks()
+        self.paused_time_offset = 0
+        self.pause_start_time = 0
+        self.game_over = False
+        self.enemies_captured = 0
+        self.enemies_escaped = 0
+        self.state = GameState.PLAYING
+    
+    def reset_game(self):
+        """Resetea el estado del juego"""
+        self.player = None
+        self.enemies = []
+        self.map_grid = []
+        self.mode = None
+        self.game_over = False
+        self.game_over_reason = ""
+        self.enemies_captured = 0
+        self.enemies_escaped = 0
+        self.paused_time_offset = 0
+        self.pause_start_time = 0
+    
+    def update(self, current_time: int):
+        """Actualiza la lógica del juego"""
+        # No actualizar si está pausado o en confirmación de salida
+        if self.state not in [GameState.PLAYING] or self.game_over:
+            return
+        
+        # Ajusta tiempo considerando pausas
+        adjusted_time = current_time - self.paused_time_offset
+        
+        keys = pygame.key.get_pressed()
+        
+        # Actualiza jugador
+        if self.player:
+            self.player.update(keys, self.map_grid, adjusted_time, self.mode)
+            self.player.update_traps(adjusted_time)
+            
+            # Actualiza puntuación (puntos por tiempo)
+            elapsed = (adjusted_time - self.start_time) / 1000.0
+            self.player.score = int(elapsed * POINTS_PER_SECOND)
+        
+        # Actualiza enemigos
+        if self.player:
+            player_pos = (self.player.row, self.player.col)
+            rows, cols = len(self.map_grid), len(self.map_grid[0])
+            
+            for enemy in self.enemies:
+                # Respawn de enemigos muertos (solo en modo Escapa)
+                if not enemy.alive and self.mode == GameMode.ESCAPA:
+                    if adjusted_time - enemy.death_time >= TRAP_RESPAWN_TIME:
+                        # Respawn enemigo en posición aleatoria válida
+                        attempts = 0
+                        while attempts < 100:
+                            r = random.randint(1, rows - 2)
+                            c = random.randint(1, cols - 2)
+                            tile = self.map_grid[r][c]
+                            # En modo Cazador: enemigos pueden usar túneles también
+                            can_pass = (tile.tile_type in [TileType.CAMINO, TileType.LIANAS, TileType.TUNEL] 
+                                       if self.mode == GameMode.CAZADOR 
+                                       else tile.tile_type in [TileType.CAMINO, TileType.LIANAS])
+                            if (can_pass and 
+                                (r, c) != (self.player.row, self.player.col) and
+                                (r, c) != self.exit_pos):
+                                enemy.row = r
+                                enemy.col = c
+                                enemy.x = c * TILE_SIZE + MAP_OFFSET_X
+                                enemy.y = r * TILE_SIZE + MAP_OFFSET_Y
+                                enemy.path = []
+                                enemy.alive = True
+                                enemy.death_time = 0
+                                break
+                            attempts += 1
+                    continue
+                
+                if not enemy.alive:
+                    continue
+                
+                # Actualizar posición del enemigo primero
+                if self.mode == GameMode.ESCAPA:
+                    # Los enemigos siempre se mueven, incluso si el jugador está en un túnel
+                    enemy.update(player_pos, adjusted_time, self.mode, self.map_grid)
+                    
+                    # Verifica colisión con jugador (solo si el jugador NO está en un túnel)
+                    player_tile = self.map_grid[self.player.row][self.player.col]
+                    if player_tile.tile_type != TileType.TUNEL:
+                        if enemy.check_collision_with_player(self.player.row, self.player.col):
+                            self.game_over = True
+                            self.game_over_reason = "¡Un enemigo te alcanzó!"
+                            self.end_game()
+                else:  # CAZADOR
+                    enemy.update(player_pos, adjusted_time, self.mode, self.map_grid)
+                
+                # Verifica colisión con trampas DESPUÉS de actualizar posición
+                # (Las trampas funcionan en ambos modos)
+                if enemy.alive:
+                    trap = self.player.get_trap_at(enemy.row, enemy.col)
+                    if trap and trap.active:
+                        # La trampa elimina al enemigo
+                        trap.trigger(adjusted_time)
+                        enemy.alive = False
+                        enemy.death_time = adjusted_time
+                        self.player.score += POINTS_PER_ENEMY
+                        if self.mode == GameMode.CAZADOR:
+                            self.enemies_captured += 1
+                            # Cuando un cazador es atrapado, los demás aparecen en zonas distintas
+                            self.respawn_other_enemies(enemy, rows, cols)
+                
+                # Verifica si enemigo alcanza la salida (solo modo Cazador)
+                if self.mode == GameMode.CAZADOR and enemy.alive:
+                    if enemy.row == self.exit_pos[0] and enemy.col == self.exit_pos[1]:
+                        enemy.alive = False
+                        self.enemies_escaped += 1
+        
+        # Verifica si jugador alcanza la salida (solo en modo Escapa)
+        if self.mode == GameMode.ESCAPA and self.player:
+            if self.player.row == self.exit_pos[0] and self.player.col == self.exit_pos[1]:
+                self.game_over = True
+                self.game_over_reason = "¡Escapaste exitosamente!"
+                self.end_game()
+        
+        # Verifica fin del juego en modo Cazador
+        if self.mode == GameMode.CAZADOR and self.player:
+            alive_enemies = [e for e in self.enemies if e.alive]
+            total_enemies = len(self.enemies)
+            
+            # Si todos los enemigos han sido eliminados (atrapados o escapados)
+            if len(alive_enemies) == 0:
+                self.game_over = True
+                if self.enemies_captured == 0:
+                    # No atrapaste ninguno: derrota
+                    self.game_over_reason = f"¡Derrota! No atrapaste ningún enemigo. {self.enemies_escaped} escaparon."
+                elif self.enemies_captured == total_enemies:
+                    # Atrapaste todos: victoria perfecta
+                    self.game_over_reason = f"¡Victoria perfecta! Atrapaste todos los {total_enemies} enemigos."
+                else:
+                    # Atrapaste algunos: victoria parcial
+                    self.game_over_reason = f"¡Victoria parcial! Atrapaste {self.enemies_captured} de {total_enemies} enemigos. {self.enemies_escaped} escaparon."
+                self.end_game()
+    
+    def teleport_between_tunnels(self):
+        """Teletransporta al jugador entre túneles si está en uno"""
+        if not self.player or not self.tunnel_positions:
+            return
+        
+        current_pos = (self.player.row, self.player.col)
+        
+        # Verifica si el jugador está en un túnel
+        if current_pos not in self.tunnel_positions:
+            return
+        
+        # Encontrar otro túnel distinto
+        other_tunnels = [t for t in self.tunnel_positions if t != current_pos]
+        
+        if not other_tunnels:
+            return  # No hay otros túneles disponibles
+        
+        # Seleccionar un túnel aleatorio
+        target_tunnel = random.choice(other_tunnels)
+        
+        # Teletransportar al jugador
+        self.player.row, self.player.col = target_tunnel
+        self.player.x = target_tunnel[1] * TILE_SIZE + MAP_OFFSET_X
+        self.player.y = target_tunnel[0] * TILE_SIZE + MAP_OFFSET_Y
+        
+        # Forzar a todos los enemigos a actualizar su pathfinding y reubicarlos
+        # para que persigan al jugador en su nueva posición
+        current_time = pygame.time.get_ticks()
+        new_player_pos = (self.player.row, self.player.col)
+        
+        # Reubicar enemigos en posiciones aleatorias válidas (pero no en túneles)
+        rows, cols = len(self.map_grid), len(self.map_grid[0])
+        for enemy in self.enemies:
+            if enemy.alive:
+                # Resetear el tiempo de última actualización para forzar recálculo
+                enemy.last_path_update = 0
+                # Limpiar el path actual
+                enemy.path = []
+                
+                # Reubicar enemigo en posición aleatoria válida (no en túneles)
+                attempts = 0
+                while attempts < 50:
+                    r = random.randint(1, rows - 2)
+                    c = random.randint(1, cols - 2)
+                    tile = self.map_grid[r][c]
+                    
+                    # En modo Escapa: enemigos NO pueden estar en túneles
+                    if self.mode == GameMode.ESCAPA:
+                        can_spawn = tile.tile_type in [TileType.CAMINO, TileType.LIANAS]
+                    else:
+                        can_spawn = tile.tile_type in [TileType.CAMINO, TileType.LIANAS, TileType.TUNEL]
+                    
+                    if (can_spawn and 
+                        (r, c) != new_player_pos and
+                        (r, c) != self.exit_pos):
+                        enemy.row = r
+                        enemy.col = c
+                        enemy.x = c * TILE_SIZE + MAP_OFFSET_X
+                        enemy.y = r * TILE_SIZE + MAP_OFFSET_Y
+                        break
+                    attempts += 1
+                
+                # Si estamos en modo Escapa, calcular nuevo path inmediatamente
+                if self.mode == GameMode.ESCAPA:
+                    current_grid_pos = (enemy.row, enemy.col)
+                    # Usar función que encuentra objetivo accesible si jugador está en túnel
+                    accessible_target = enemy._find_accessible_target(new_player_pos, self.map_grid, self.mode)
+                    enemy.path = Pathfinder.astar(self.map_grid, current_grid_pos, accessible_target, 
+                                                 for_enemy=True, game_mode=self.mode)
+                    if enemy.path:
+                        enemy.last_path_update = current_time
+    
+    def try_capture_enemy(self):
+        """Intenta atrapar un enemigo cercano en modo Cazador"""
+        if not self.player or self.mode != GameMode.CAZADOR:
+            return
+        
+        player_x = self.player.x + TILE_SIZE // 2
+        player_y = self.player.y + TILE_SIZE // 2
+        
+        for enemy in self.enemies:
+            if not enemy.alive:
+                continue
+            
+            enemy_x = enemy.x + TILE_SIZE // 2
+            enemy_y = enemy.y + TILE_SIZE // 2
+            
+            # Calcular distancia
+            distance = math.sqrt((player_x - enemy_x)**2 + (player_y - enemy_y)**2)
+            distance_tiles = distance / TILE_SIZE
+            
+            # Si está suficientemente cerca, atrapar
+            if distance_tiles <= CAZADOR_CAPTURE_DISTANCE:
+                enemy.alive = False
+                self.enemies_captured += 1
+                self.player.score += POINTS_PER_ENEMY
+                # Cuando un cazador es atrapado, los demás aparecen en zonas distintas
+                rows, cols = len(self.map_grid), len(self.map_grid[0])
+                self.respawn_other_enemies(enemy, rows, cols)
+                break
+    
+    def respawn_other_enemies(self, captured_enemy, rows: int, cols: int):
+        """Reubica a los demás enemigos en zonas distintas cuando uno es capturado"""
+        if self.mode != GameMode.CAZADOR:
+            return
+        
+        # Obtener posiciones ocupadas (jugador, salida, enemigo capturado)
+        occupied_positions = {
+            (self.player.row, self.player.col),
+            self.exit_pos,
+            (captured_enemy.row, captured_enemy.col)
+        }
+        
+        # Obtener posiciones de otros enemigos vivos
+        for other_enemy in self.enemies:
+            if other_enemy.alive and other_enemy != captured_enemy:
+                occupied_positions.add((other_enemy.row, other_enemy.col))
+        
+        # Reubicar cada enemigo vivo en una zona distinta
+        for enemy in self.enemies:
+            if enemy.alive and enemy != captured_enemy:
+                attempts = 0
+                new_pos = None
+                
+                while attempts < 200:  # Más intentos para encontrar buena posición
+                    # Buscar posición aleatoria lejos del jugador y de otras posiciones ocupadas
+                    r = random.randint(1, rows - 2)
+                    c = random.randint(1, cols - 2)
+                    
+                    tile = self.map_grid[r][c]
+                    # En modo Cazador: enemigos pueden usar túneles también
+                    can_pass = (tile.tile_type in [TileType.CAMINO, TileType.LIANAS, TileType.TUNEL] 
+                               if self.mode == GameMode.CAZADOR 
+                               else tile.tile_type in [TileType.CAMINO, TileType.LIANAS])
+                    
+                    # Verificar que sea válida y esté lejos de posiciones ocupadas
+                    if (can_pass and 
+                        (r, c) not in occupied_positions):
+                        
+                        # Verificar distancia mínima de otras posiciones ocupadas
+                        min_distance = 5  # Distancia mínima en tiles
+                        too_close = False
+                        for occ_row, occ_col in occupied_positions:
+                            dist = abs(r - occ_row) + abs(c - occ_col)
+                            if dist < min_distance:
+                                too_close = True
+                                break
+                        
+                        if not too_close:
+                            new_pos = (r, c)
+                            break
+                    
+                    attempts += 1
+                
+                # Si encontramos posición, reubicar
+                if new_pos:
+                    enemy.row, enemy.col = new_pos
+                    enemy.x = enemy.col * TILE_SIZE + MAP_OFFSET_X
+                    enemy.y = enemy.row * TILE_SIZE + MAP_OFFSET_Y
+                    enemy.path = []  # Limpiar pathfinding
+                    occupied_positions.add(new_pos)
+                else:
+                    # Si no encontramos posición lejana, usar cualquier válida
+                    attempts = 0
+                    while attempts < 100:
+                        r = random.randint(1, rows - 2)
+                        c = random.randint(1, cols - 2)
+                        tile = self.map_grid[r][c]
+                        # En modo Cazador: enemigos pueden usar túneles también
+                        can_pass = (tile.tile_type in [TileType.CAMINO, TileType.LIANAS, TileType.TUNEL] 
+                                   if self.mode == GameMode.CAZADOR 
+                                   else tile.tile_type in [TileType.CAMINO, TileType.LIANAS])
+                        if (can_pass and 
+                            (r, c) not in occupied_positions):
+                            enemy.row, enemy.col = r, c
+                            enemy.x = c * TILE_SIZE + MAP_OFFSET_X
+                            enemy.y = r * TILE_SIZE + MAP_OFFSET_Y
+                            enemy.path = []
+                            occupied_positions.add((r, c))
+                            break
+                        attempts += 1
+    
+    def end_game(self):
+        """Finaliza el juego y guarda la puntuación"""
+        if self.player and self.player.score > 0:
+            self.score_manager.add_score(self.mode, self.player_name, self.player.score)
+        self.state = GameState.GAME_OVER
+    
+    def draw(self):
+        """Dibuja todo en pantalla"""
+        self.screen.fill(BLACK)
+        
+        if self.state == GameState.MENU:
+            self.draw_menu()
+        elif self.state == GameState.NAME_INPUT:
+            self.draw_name_input()
+        elif self.state == GameState.MODE_SELECT:
+            self.draw_mode_select()
+        elif self.state == GameState.PLAYING:
+            self.draw_game()
+        elif self.state == GameState.EXIT_CONFIRM:
+            # Dibuja el juego de fondo (pausado)
+            self.draw_game()
+            # Dibuja diálogo de confirmación encima
+            self.draw_exit_confirm()
+        elif self.state == GameState.PAUSED:
+            # Dibuja el juego de fondo (pausado)
+            self.draw_game()
+            # Dibuja overlay de pausa
+            self.draw_pause_overlay()
+        elif self.state == GameState.GAME_OVER:
+            self.draw_game_over()
+        elif self.state == GameState.HIGH_SCORES:
+            self.draw_high_scores()
+        
+        pygame.display.flip()
+    
+    def draw_pause_overlay(self):
+        """Dibuja el overlay de pausa"""
+        # Fondo semitransparente
+        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        overlay.set_alpha(150)
+        overlay.fill(BLACK)
+        self.screen.blit(overlay, (0, 0))
+        
+        #Texto de pausa
+        pause_text = self.font.render("PAUSA", True, YELLOW)
+        pause_rect = pause_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
+        self.screen.blit(pause_text, pause_rect)
+        
+        resume_text = self.small_font.render("Presiona ESC o ENTER para continuar", True, WHITE)
+        resume_rect = resume_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 50))
+        self.screen.blit(resume_text, resume_rect)
+    
+    def draw_menu(self):
+        """Dibuja el menú principal"""
+        title = self.font.render("JUEGO - ESCAPA Y CAZADOR", True, WHITE)
+        title_rect = title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 100))
+        self.screen.blit(title, title_rect)
+        
+        start_text = self.small_font.render("Presiona ENTER para comenzar", True, WHITE)
+        start_rect = start_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
+        self.screen.blit(start_text, start_rect)
+        
+        scores_text = self.small_font.render("Presiona H para ver puntuaciones", True, WHITE)
+        scores_rect = scores_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 40))
+        self.screen.blit(scores_text, scores_rect)
+    
+    def draw_name_input(self):
+        """Dibuja la pantalla de entrada de nombre"""
+        title = self.font.render("Ingresa tu nombre:", True, WHITE)
+        title_rect = title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 50))
+        self.screen.blit(title, title_rect)
+        
+        input_text = self.font.render(self.name_input + "_", True, YELLOW)
+        input_rect = input_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
+        self.screen.blit(input_text, input_rect)
+        
+        hint = self.small_font.render("Presiona ENTER para continuar", True, GRAY)
+        hint_rect = hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 50))
+        self.screen.blit(hint, hint_rect)
+    
+    def draw_mode_select(self):
+        """Dibuja la pantalla de selección de modo"""
+        title = self.font.render(f"Selecciona modo - {self.player_name}", True, WHITE)
+        title_rect = title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 150))
+        self.screen.blit(title, title_rect)
+        
+        mode1 = self.font.render("1 - ESCAPA", True, GREEN)
+        mode1_rect = mode1.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 50))
+        self.screen.blit(mode1, mode1_rect)
+        
+        desc1 = self.small_font.render("Escapa de los enemigos y llega a la salida", True, GRAY)
+        desc1_rect = desc1.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 20))
+        self.screen.blit(desc1, desc1_rect)
+        
+        mode2 = self.font.render("2 - CAZADOR", True, RED)
+        mode2_rect = mode2.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 50))
+        self.screen.blit(mode2, mode2_rect)
+        
+        desc2 = self.small_font.render("Atrapa enemigos antes de que escapen por la salida", True, GRAY)
+        desc2_rect = desc2.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 80))
+        self.screen.blit(desc2, desc2_rect)
+        
+        instructions2 = self.small_font.render("Usa E para atrapar o ESPACIO para trampas", True, CYAN)
+        instructions2_rect = instructions2.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 110))
+        self.screen.blit(instructions2, instructions2_rect)
+        
+        objective2 = self.small_font.render("OBJETIVO: Atrapa al menos un enemigo para ganar", True, YELLOW)
+        objective2_rect = objective2.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 140))
+        self.screen.blit(objective2, objective2_rect)
+        
+        warning2 = self.small_font.render("Si todos escapan sin atrapar ninguno, pierdes", True, RED)
+        warning2_rect = warning2.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 170))
+        self.screen.blit(warning2, warning2_rect)
+    
+    def draw_game(self):
+        """Dibuja el juego en curso"""
+        # Dibuja el mapa
+        rows, cols = len(self.map_grid), len(self.map_grid[0])
+        for r in range(rows):
+            for c in range(cols):
+                x = c * TILE_SIZE + MAP_OFFSET_X
+                y = r * TILE_SIZE + MAP_OFFSET_Y
+                tile = self.map_grid[r][c]
+                pygame.draw.rect(self.screen, tile.color, 
+                               (x, y, TILE_SIZE, TILE_SIZE))
+                pygame.draw.rect(self.screen, BLACK, 
+                               (x, y, TILE_SIZE, TILE_SIZE), 1)
+                
+                # Indicador visual para túneles (solo jugador puede pasar)
+                if tile.tile_type == TileType.TUNEL:
+                    # Dibujar un símbolo visual más claro para túneles
+                    center_x = x + TILE_SIZE // 2
+                    center_y = y + TILE_SIZE // 2
+                    # Círculo exterior
+                    pygame.draw.circle(self.screen, CYAN, 
+                                     (center_x, center_y), 
+                                     TILE_SIZE // 3, 2)
+                    # Círculo interior
+                    pygame.draw.circle(self.screen, BLUE, 
+                                     (center_x, center_y), 
+                                     TILE_SIZE // 6)
+                    # Indicador de teletransporte si el jugador está aquí
+                    if self.player and (r, c) == (self.player.row, self.player.col):
+                        teleport_text = self.small_font.render("ENTER", True, YELLOW)
+                        teleport_rect = teleport_text.get_rect(center=(center_x, center_y - TILE_SIZE // 2 - 5))
+                        self.screen.blit(teleport_text, teleport_rect)
+                
+                # Indicador visual para lianas (solo enemigos pueden pasar)
+                if tile.tile_type == TileType.LIANAS:
+                    # Dibujar líneas diagonales para indicar que es solo para enemigos
+                    pygame.draw.line(self.screen, DARK_BROWN, 
+                                   (x + 2, y + 2), 
+                                   (x + TILE_SIZE - 2, y + TILE_SIZE - 2), 2)
+                    pygame.draw.line(self.screen, DARK_BROWN, 
+                                   (x + TILE_SIZE - 2, y + 2), 
+                                   (x + 2, y + TILE_SIZE - 2), 2)
+        
+        # Dibuja salida
+        exit_x = self.exit_pos[1] * TILE_SIZE + MAP_OFFSET_X
+        exit_y = self.exit_pos[0] * TILE_SIZE + MAP_OFFSET_Y
+        pygame.draw.rect(self.screen, YELLOW, 
+                        (exit_x, exit_y, TILE_SIZE, TILE_SIZE))
+        exit_text = self.small_font.render("EXIT", True, BLACK)
+        exit_text_rect = exit_text.get_rect(center=(exit_x + TILE_SIZE // 2, 
+                                                     exit_y + TILE_SIZE // 2))
+        self.screen.blit(exit_text, exit_text_rect)
+        
+        # Dibuja trampas
+        if self.player:
+            for trap in self.player.traps:
+                if trap.active:
+                    trap_x = trap.col * TILE_SIZE + MAP_OFFSET_X
+                    trap_y = trap.row * TILE_SIZE + MAP_OFFSET_Y
+                    pygame.draw.circle(self.screen, RED, 
+                                     (trap_x + TILE_SIZE // 2, 
+                                      trap_y + TILE_SIZE // 2), 
+                                     TILE_SIZE // 3)
+        
+        # Dibuja enemigos
+        for enemy in self.enemies:
+            if enemy.alive:
+                pygame.draw.circle(self.screen, RED, 
+                                 (int(enemy.x + TILE_SIZE // 2), 
+                                  int(enemy.y + TILE_SIZE // 2)), 
+                                 TILE_SIZE // 2 - 2)
+        
+        # Dibuja jugador
+        if self.player:
+            pygame.draw.circle(self.screen, BLUE, 
+                             (int(self.player.x + TILE_SIZE // 2), 
+                              int(self.player.y + TILE_SIZE // 2)), 
+                             TILE_SIZE // 2 - 2)
+        
+        # Dibujar botón de salir
+        self.draw_exit_button()
+        
+        # Dibujar HUD
+        self.draw_hud()
+    
+    def draw_exit_button(self):
+        """Dibuja el botón de salir en la esquina superior derecha"""
+        button_rect = pygame.Rect(SCREEN_WIDTH - 150, 10, 140, 40)
+        
+        # Color del botón (hover effect)
+        mouse_pos = pygame.mouse.get_pos()
+        if button_rect.collidepoint(mouse_pos):
+            button_color = DARK_RED
+        else:
+            button_color = RED
+        
+        pygame.draw.rect(self.screen, button_color, button_rect)
+        pygame.draw.rect(self.screen, WHITE, button_rect, 2)
+        
+        # Texto del botón
+        button_text = self.small_font.render("SALIR (ESC)", True, WHITE)
+        text_rect = button_text.get_rect(center=button_rect.center)
+        self.screen.blit(button_text, text_rect)
+    
+    def draw_exit_confirm(self):
+        """Dibuja el diálogo de confirmación de salida"""
+        # Fondo semitransparente
+        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        overlay.set_alpha(180)
+        overlay.fill(BLACK)
+        self.screen.blit(overlay, (0, 0))
+        
+        # Caja del diálogo
+        dialog_width = 500
+        dialog_height = 250
+        dialog_x = (SCREEN_WIDTH - dialog_width) // 2
+        dialog_y = (SCREEN_HEIGHT - dialog_height) // 2
+        dialog_rect = pygame.Rect(dialog_x, dialog_y, dialog_width, dialog_height)
+        
+        pygame.draw.rect(self.screen, DARK_GRAY, dialog_rect)
+        pygame.draw.rect(self.screen, WHITE, dialog_rect, 3)
+        
+        # Título
+        title = self.font.render("¿Salir del juego?", True, YELLOW)
+        title_rect = title.get_rect(center=(dialog_x + dialog_width // 2, dialog_y + 50))
+        self.screen.blit(title, title_rect)
+        
+        # Mensaje
+        message = self.small_font.render("¿Estás seguro de que deseas salir?", True, WHITE)
+        message_rect = message.get_rect(center=(dialog_x + dialog_width // 2, dialog_y + 100))
+        self.screen.blit(message, message_rect)
+        
+        # Opciones
+        option1 = self.small_font.render("SÍ (Y o ENTER) - Salir al menú", True, GREEN)
+        option1_rect = option1.get_rect(center=(dialog_x + dialog_width // 2, dialog_y + 150))
+        self.screen.blit(option1, option1_rect)
+        
+        option2 = self.small_font.render("NO (N o ESC) - Continuar jugando", True, RED)
+        option2_rect = option2.get_rect(center=(dialog_x + dialog_width // 2, dialog_y + 190))
+        self.screen.blit(option2, option2_rect)
+    
+    def draw_hud(self):
+        """Dibuja el HUD del juego"""
+        if not self.player:
+            return
+        
+        y_offset = 10
+        
+        # Nombre del jugador
+        name_text = self.small_font.render(f"Jugador: {self.player_name}", True, WHITE)
+        self.screen.blit(name_text, (10, y_offset))
+        y_offset += 30
+        
+        # Modo de juego
+        mode_text = self.small_font.render(f"Modo: {self.mode.value}", True, WHITE)
+        self.screen.blit(mode_text, (10, y_offset))
+        y_offset += 30
+        
+        # Puntuación
+        score_text = self.small_font.render(f"Puntos: {self.player.score}", True, WHITE)
+        self.screen.blit(score_text, (10, y_offset))
+        y_offset += 30
+        
+        # Tiempo (ajustado por pausas)
+        current_time = pygame.time.get_ticks()
+        adjusted_time = current_time - self.paused_time_offset
+        elapsed = (adjusted_time - self.start_time) / 1000.0
+        time_text = self.small_font.render(f"Tiempo: {elapsed:.1f}s", True, WHITE)
+        self.screen.blit(time_text, (10, y_offset))
+        y_offset += 30
+        
+        # Energía
+        energy_text = self.small_font.render(f"Energía: {int(self.player.energy)}/{PLAYER_ENERGY_MAX}", True, WHITE)
+        self.screen.blit(energy_text, (10, y_offset))
+        y_offset += 20
+        
+        # Barra de energía
+        bar_width = 200
+        bar_height = 20
+        bar_x = 10
+        bar_y = y_offset
+        pygame.draw.rect(self.screen, DARK_GRAY, (bar_x, bar_y, bar_width, bar_height))
+        energy_width = int((self.player.energy / PLAYER_ENERGY_MAX) * bar_width)
+        energy_color = GREEN if self.player.energy > 30 else RED
+        pygame.draw.rect(self.screen, energy_color, (bar_x, bar_y, energy_width, bar_height))
+        pygame.draw.rect(self.screen, WHITE, (bar_x, bar_y, bar_width, bar_height), 2)
+        y_offset += 35
+        
+        # Trampas
+        active_traps = len([t for t in self.player.traps if t.active])
+        traps_text = self.small_font.render(f"Trampas: {active_traps}/{MAX_TRAPS}", True, WHITE)
+        self.screen.blit(traps_text, (10, y_offset))
+        y_offset += 30
+        
+        # Cooldown de trampas
+        cooldown_remaining = max(0, TRAP_COOLDOWN - (pygame.time.get_ticks() - self.player.last_trap_time))
+        if cooldown_remaining > 0:
+            cooldown_text = self.small_font.render(f"Cooldown: {cooldown_remaining/1000:.1f}s", True, YELLOW)
+            self.screen.blit(cooldown_text, (10, y_offset))
+        
+        # Información específica del modo
+        if self.mode == GameMode.CAZADOR:
+            y_offset += 40
+            alive_enemies = len([e for e in self.enemies if e.alive])
+            total_enemies = len(self.enemies)
+            
+            # Enemigos atrapados
+            progress_text = self.small_font.render(
+                f"Atrapados: {self.enemies_captured}/{total_enemies}", 
+                True, GREEN)
+            self.screen.blit(progress_text, (10, y_offset))
+            y_offset += 25
+            
+            # Enemigos escapados
+            escaped_text = self.small_font.render(
+                f"Escapados: {self.enemies_escaped}/{total_enemies}", 
+                True, RED)
+            self.screen.blit(escaped_text, (10, y_offset))
+            y_offset += 25
+            
+            # Enemigos restantes
+            remaining_text = self.small_font.render(
+                f"Restantes: {alive_enemies}", 
+                True, YELLOW if alive_enemies > 0 else GREEN)
+            self.screen.blit(remaining_text, (10, y_offset))
+            y_offset += 30
+            
+            # Objetivo
+            if self.enemies_captured == 0 and self.enemies_escaped > 0:
+                objective_text = self.small_font.render(
+                    "¡PELIGRO! Atrapa al menos uno o perderás", 
+                    True, RED)
+            else:
+                objective_text = self.small_font.render(
+                    "OBJETIVO: Atrapa enemigos antes de que escapen", 
+                    True, YELLOW)
+            self.screen.blit(objective_text, (10, y_offset))
+            y_offset += 25
+            
+            # Instrucciones
+            capture_hint = self.small_font.render(
+                "E: Atrapar | Espacio: Trampa", 
+                True, CYAN)
+            self.screen.blit(capture_hint, (10, y_offset))
+        
+        # Controles
+        controls_y = SCREEN_HEIGHT - 140
+        controls = [
+            "Controles:",
+            "WASD / Flechas: Mover (discreto)",
+            "Shift: Correr más rápido",
+            "Espacio: Colocar trampa",
+        ]
+        
+        if self.mode == GameMode.CAZADOR:
+            controls.append("E: Atrapar enemigo cercano")
+            controls.append("Terreno: Solo Lianas (NO túneles)")
+        else:
+            controls.append("ENTER: Teletransporte (en túneles)")
+            controls.append("Terreno: Solo Túneles (NO lianas)")
+        
+        controls.append("ESC: Salir/Menú")
+        
+        for i, control in enumerate(controls):
+            control_text = self.small_font.render(control, True, GRAY)
+            self.screen.blit(control_text, (SCREEN_WIDTH - 250, controls_y + i * 25))
+    
+    def draw_game_over(self):
+        """Dibuja la pantalla de fin de juego"""
+        title = self.font.render("GAME OVER", True, RED)
+        title_rect = title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 100))
+        self.screen.blit(title, title_rect)
+        
+        reason = self.font.render(self.game_over_reason, True, WHITE)
+        reason_rect = reason.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 50))
+        self.screen.blit(reason, reason_rect)
+        
+        if self.player:
+            score_text = self.font.render(f"Puntuación: {self.player.score}", True, YELLOW)
+            score_rect = score_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
+            self.screen.blit(score_text, score_rect)
+        
+        continue_text = self.small_font.render("Presiona ENTER para continuar", True, WHITE)
+        continue_rect = continue_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 100))
+        self.screen.blit(continue_text, continue_rect)
+        
+        scores_text = self.small_font.render("Presiona H para ver puntuaciones", True, GRAY)
+        scores_rect = scores_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 130))
+        self.screen.blit(scores_text, scores_rect)
+    
+    def draw_high_scores(self):
+        """Dibuja la pantalla de puntuaciones altas"""
+        title = self.font.render("PUNTUACIONES ALTAS", True, WHITE)
+        title_rect = title.get_rect(center=(SCREEN_WIDTH // 2, 50))
+        self.screen.blit(title, title_rect)
+        
+        y_offset = 150
+        
+        # Mostrar puntuaciones para ambos modos
+        for mode in [GameMode.ESCAPA, GameMode.CAZADOR]:
+            mode_title = self.font.render(f"Modo: {mode.value}", True, YELLOW)
+            mode_rect = mode_title.get_rect(center=(SCREEN_WIDTH // 2, y_offset))
+            self.screen.blit(mode_title, mode_rect)
+            y_offset += 50
+            
+            scores = self.score_manager.get_top_scores(mode)
+            if scores:
+                for i, score_data in enumerate(scores):
+                    score_text = self.small_font.render(
+                        f"{i+1}. {score_data['name']}: {score_data['score']}", 
+                        True, WHITE)
+                    score_rect = score_text.get_rect(center=(SCREEN_WIDTH // 2, y_offset))
+                    self.screen.blit(score_text, score_rect)
+                    y_offset += 35
+            else:
+                no_scores = self.small_font.render("Sin puntuaciones aún", True, GRAY)
+                no_scores_rect = no_scores.get_rect(center=(SCREEN_WIDTH // 2, y_offset))
+                self.screen.blit(no_scores, no_scores_rect)
+                y_offset += 35
+            
+            y_offset += 20
+        
+        back_text = self.small_font.render("Presiona ESC o ENTER para volver", True, GRAY)
+        back_rect = back_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 50))
+        self.screen.blit(back_text, back_rect)
+
 # ============================================================================
 # PUNTO DE ENTRADA
 # ============================================================================
+
+def main():
+    """Función principal"""
+    try:
+        game = Game()
+        game.run()
+    except Exception as e:
+        print(f"Error en el juego: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
