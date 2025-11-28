@@ -1715,6 +1715,178 @@ class Game:
         back_text = self.small_font.render("Presiona ESC o ENTER para volver", True, GRAY)
         back_rect = back_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 50))
         self.screen.blit(back_text, back_rect)
+    def start_game(self, mode: GameMode):
+        """Inicia una nueva partida"""
+        self.mode = mode
+        self.map_grid, self.start_pos, self.exit_pos, self.tunnel_positions = MapGenerator.generate_map(MAP_ROWS, MAP_COLS)
+        
+        # Crear jugador
+        self.player = Player(self.start_pos[0], self.start_pos[1])
+        
+        # Crear enemigos en posiciones aleatorias válidas
+        self.enemies = []
+        rows, cols = len(self.map_grid), len(self.map_grid[0])
+        enemy_positions = set()
+        
+        for _ in range(ENEMY_COUNT):
+            attempts = 0
+            while attempts < 100:
+                r = random.randint(1, rows - 2)
+                c = random.randint(1, cols - 2)
+                
+                tile = self.map_grid[r][c]
+                # En modo Cazador: enemigos pueden usar túneles también
+                can_pass = (tile.tile_type in [TileType.CAMINO, TileType.LIANAS, TileType.TUNEL] 
+                           if self.mode == GameMode.CAZADOR 
+                           else tile.tile_type in [TileType.CAMINO, TileType.LIANAS])
+                if ((r, c) not in enemy_positions and 
+                    (r, c) != self.start_pos and 
+                    (r, c) != self.exit_pos and
+                    can_pass):
+                    enemy = Enemy(r, c, self.map_grid)
+                    self.enemies.append(enemy)
+                    enemy_positions.add((r, c))
+                    break
+                attempts += 1
+        
+        self.start_time = pygame.time.get_ticks()
+        self.paused_time_offset = 0
+        self.pause_start_time = 0
+        self.game_over = False
+        self.enemies_captured = 0
+        self.enemies_escaped = 0
+        self.state = GameState.PLAYING
+    
+    def reset_game(self):
+        """Resetea el estado del juego"""
+        self.player = None
+        self.enemies = []
+        self.map_grid = []
+        self.mode = None
+        self.game_over = False
+        self.game_over_reason = ""
+        self.enemies_captured = 0
+        self.enemies_escaped = 0
+        self.paused_time_offset = 0
+        self.pause_start_time = 0
+    
+    def update(self, current_time: int):
+        """Actualiza la lógica del juego"""
+        # No actualizar si está pausado o en confirmación de salida
+        if self.state not in [GameState.PLAYING] or self.game_over:
+            return
+        
+        # Ajustar tiempo considerando pausas
+        adjusted_time = current_time - self.paused_time_offset
+        
+        keys = pygame.key.get_pressed()
+        
+        # Actualizar jugador
+        if self.player:
+            self.player.update(keys, self.map_grid, adjusted_time, self.mode)
+            self.player.update_traps(adjusted_time)
+            
+            # Actualizar puntuación (puntos por tiempo)
+            elapsed = (adjusted_time - self.start_time) / 1000.0
+            self.player.score = int(elapsed * POINTS_PER_SECOND)
+        
+        # Actualizar enemigos
+        if self.player:
+            player_pos = (self.player.row, self.player.col)
+            rows, cols = len(self.map_grid), len(self.map_grid[0])
+            
+            for enemy in self.enemies:
+                # Respawn de enemigos muertos (solo en modo Escapa)
+                if not enemy.alive and self.mode == GameMode.ESCAPA:
+                    if adjusted_time - enemy.death_time >= TRAP_RESPAWN_TIME:
+                        # Respawn enemigo en posición aleatoria válida
+                        attempts = 0
+                        while attempts < 100:
+                            r = random.randint(1, rows - 2)
+                            c = random.randint(1, cols - 2)
+                            tile = self.map_grid[r][c]
+                            # En modo Cazador: enemigos pueden usar túneles también
+                            can_pass = (tile.tile_type in [TileType.CAMINO, TileType.LIANAS, TileType.TUNEL] 
+                                       if self.mode == GameMode.CAZADOR 
+                                       else tile.tile_type in [TileType.CAMINO, TileType.LIANAS])
+                            if (can_pass and 
+                                (r, c) != (self.player.row, self.player.col) and
+                                (r, c) != self.exit_pos):
+                                enemy.row = r
+                                enemy.col = c
+                                enemy.x = c * TILE_SIZE + MAP_OFFSET_X
+                                enemy.y = r * TILE_SIZE + MAP_OFFSET_Y
+                                enemy.path = []
+                                enemy.alive = True
+                                enemy.death_time = 0
+                                break
+                            attempts += 1
+                    continue
+                
+                if not enemy.alive:
+                    continue
+                
+                # Actualizar posición del enemigo primero
+                if self.mode == GameMode.ESCAPA:
+                    # Los enemigos siempre se mueven, incluso si el jugador está en un túnel
+                    enemy.update(player_pos, adjusted_time, self.mode, self.map_grid)
+                    
+                    # Verificar colisión con jugador (solo si el jugador NO está en un túnel)
+                    player_tile = self.map_grid[self.player.row][self.player.col]
+                    if player_tile.tile_type != TileType.TUNEL:
+                        if enemy.check_collision_with_player(self.player.row, self.player.col):
+                            self.game_over = True
+                            self.game_over_reason = "¡Un enemigo te alcanzó!"
+                            self.end_game()
+                else:  # CAZADOR
+                    enemy.update(player_pos, adjusted_time, self.mode, self.map_grid)
+                
+                # Verificar colisión con trampas DESPUÉS de actualizar posición
+                # (Las trampas funcionan en ambos modos)
+                if enemy.alive:
+                    trap = self.player.get_trap_at(enemy.row, enemy.col)
+                    if trap and trap.active:
+                        # La trampa elimina al enemigo
+                        trap.trigger(adjusted_time)
+                        enemy.alive = False
+                        enemy.death_time = adjusted_time
+                        self.player.score += POINTS_PER_ENEMY
+                        if self.mode == GameMode.CAZADOR:
+                            self.enemies_captured += 1
+                            # Cuando un cazador es atrapado, los demás aparecen en zonas distintas
+                            self.respawn_other_enemies(enemy, rows, cols)
+                
+                # Verificar si enemigo alcanza la salida (solo modo Cazador)
+                if self.mode == GameMode.CAZADOR and enemy.alive:
+                    if enemy.row == self.exit_pos[0] and enemy.col == self.exit_pos[1]:
+                        enemy.alive = False
+                        self.enemies_escaped += 1
+        
+        # Verificar si jugador alcanza la salida (solo en modo Escapa)
+        if self.mode == GameMode.ESCAPA and self.player:
+            if self.player.row == self.exit_pos[0] and self.player.col == self.exit_pos[1]:
+                self.game_over = True
+                self.game_over_reason = "¡Escapaste exitosamente!"
+                self.end_game()
+        
+        # Verificar fin del juego en modo Cazador
+        if self.mode == GameMode.CAZADOR and self.player:
+            alive_enemies = [e for e in self.enemies if e.alive]
+            total_enemies = len(self.enemies)
+            
+            # Si todos los enemigos han sido eliminados (atrapados o escapados)
+            if len(alive_enemies) == 0:
+                self.game_over = True
+                if self.enemies_captured == 0:
+                    # No atrapaste ninguno: derrota
+                    self.game_over_reason = f"¡Derrota! No atrapaste ningún enemigo. {self.enemies_escaped} escaparon."
+                elif self.enemies_captured == total_enemies:
+                    # Atrapaste todos: victoria perfecta
+                    self.game_over_reason = f"¡Victoria perfecta! Atrapaste todos los {total_enemies} enemigos."
+                else:
+                    # Atrapaste algunos: victoria parcial
+                    self.game_over_reason = f"¡Victoria parcial! Atrapaste {self.enemies_captured} de {total_enemies} enemigos. {self.enemies_escaped} escaparon."
+                self.end_game()
 
 # ============================================================================
 # PUNTO DE ENTRADA
