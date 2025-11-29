@@ -25,7 +25,7 @@ MAP_OFFSET_X = 50
 MAP_OFFSET_Y = 100
 
 # Colores
-BLACK = (10, 15, 30)         # Muros oscuros
+BLACK = (10, 15, 30)         # Muros 
 WHITE = (255, 255, 255)
 GRAY = (80, 80, 120)
 DARK_GRAY = (30, 30, 50)
