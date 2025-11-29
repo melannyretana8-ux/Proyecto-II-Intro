@@ -1703,7 +1703,6 @@ class Game:
         self.screen.blit(scores_text, scores_rect)
 
     def draw_victory(self):
-        self.screen.fill(BLACK)
         title = self.font.render("¡VICTORIA!", True, NEON_TURQUOISE)
         title_rect = title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 100))
         self.screen.blit(title, title_rect)
