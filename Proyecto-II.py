@@ -25,10 +25,10 @@ MAP_OFFSET_X = 50
 MAP_OFFSET_Y = 100
 
 # Colores
-BLACK = (0, 0, 0)
+BLACK = (10, 15, 30)         # Muros oscuros
 WHITE = (255, 255, 255)
-GRAY = (128, 128, 128)
-DARK_GRAY = (64, 64, 64)
+GRAY = (80, 80, 120)
+DARK_GRAY = (30, 30, 50)
 GREEN = (0, 255, 0)
 DARK_GREEN = (0, 150, 0)
 BROWN = (139, 69, 19)
@@ -41,6 +41,10 @@ YELLOW = (255, 255, 0)
 ORANGE = (255, 165, 0)
 PURPLE = (128, 0, 128)
 CYAN = (0, 255, 255)
+NEON_TURQUOISE  = (0, 255, 180)      # Camino
+NEON_FUCHSIA    = (255, 0, 180)      # Lianas
+CIBERPUNK_WALL  = (10, 10, 10)       # Muros 
+NEON_PURPLE     = (155, 0, 255)      # Túneles
 
 # Configuración del jugador
 PLAYER_SPEED = 2
@@ -85,6 +89,7 @@ class GameState(Enum):
     EXIT_CONFIRM = "exit_confirm"
     GAME_OVER = "game_over"
     HIGH_SCORES = "high_scores"
+    VICTORY = "victory"
 
 # ============================================================================
 # CLASES DE CASILLAS
@@ -103,14 +108,15 @@ class Tile:
         self.color = self._get_color()
     
     def _get_color(self):
-        """Retorna el color según el tipo de casilla"""
-        colors = {
-            TileType.CAMINO: DARK_GREEN,
-            TileType.LIANAS: BROWN,
-            TileType.TUNEL: DARK_BLUE,
-            TileType.MURO: DARK_GRAY
-        }
-        return colors.get(self.tile_type, GRAY)
+        if self.tile_type == TileType.CAMINO:
+            return NEON_TURQUOISE
+        elif self.tile_type == TileType.LIANAS:
+            return NEON_FUCHSIA
+        elif self.tile_type == TileType.TUNEL:
+            return NEON_PURPLE
+        elif self.tile_type == TileType.MURO:
+            return CIBERPUNK_WALL
+        return (50, 50, 50)
     
     def can_player_pass(self) -> bool:
         """Verifica si el jugador puede pasar por esta casilla"""
@@ -849,11 +855,16 @@ class Game:
                 else:
                     if len(self.name_input) < 20:
                         self.name_input += event.unicode
+
+            elif self.state == GameState.VICTORY:
+                if event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
+                    self.state = GameState.MENU
+                    self.reset_game()
             
             elif self.state == GameState.MODE_SELECT:
-                if event.key == pygame.K_1:
+                if event.key in (pygame.K_1, pygame.K_KP1):  
                     self.start_game(GameMode.ESCAPA)
-                elif event.key == pygame.K_2:
+                elif event.key in (pygame.K_2, pygame.K_KP2): 
                     self.start_game(GameMode.CAZADOR)
                 elif event.key == pygame.K_ESCAPE:
                     self.state = GameState.NAME_INPUT
@@ -909,7 +920,10 @@ class Game:
                     self.name_input = ""
                 elif event.key == pygame.K_h:
                     self.state = GameState.HIGH_SCORES
-        
+                elif event.key == pygame.K_ESCAPE:
+                    self.pause_start_time = current_time
+                    self.state = GameState.EXIT_CONFIRM
+
         # Manejar clics del mouse
         if event.type == pygame.MOUSEBUTTONDOWN:
             if event.button == 1:  # Clic izquierdo
@@ -1069,11 +1083,9 @@ class Game:
                         self.enemies_escaped += 1
         
         # Verifica si jugador alcanza la salida (solo en modo Escapa)
-        if self.mode == GameMode.ESCAPA and self.player:
-            if self.player.row == self.exit_pos[0] and self.player.col == self.exit_pos[1]:
-                self.game_over = True
-                self.game_over_reason = "¡Escapaste exitosamente!"
-                self.end_game()
+        if self.player.row == self.exit_pos[0] and self.player.col == self.exit_pos[1]:
+            self.end_game(victory=True)
+            return
         
         # Verifica fin del juego en modo Cazador
         if self.mode == GameMode.CAZADOR and self.player:
@@ -1276,12 +1288,15 @@ class Game:
                             break
                         attempts += 1
     
-    def end_game(self):
-        """Finaliza el juego y guarda la puntuación"""
+    def end_game(self, victory=False):
         if self.player and self.player.score > 0:
             self.score_manager.add_score(self.mode, self.player_name, self.player.score)
-        self.state = GameState.GAME_OVER
-    
+
+        if victory:
+            self.state = GameState.VICTORY
+        else:
+            self.state = GameState.GAME_OVER
+        
     def draw(self):
         """Dibuja todo en pantalla"""
         self.screen.fill(BLACK)
@@ -1306,6 +1321,8 @@ class Game:
             self.draw_pause_overlay()
         elif self.state == GameState.GAME_OVER:
             self.draw_game_over()
+        elif self.state == GameState.VICTORY:
+            self.draw_victory()
         elif self.state == GameState.HIGH_SCORES:
             self.draw_high_scores()
         
@@ -1338,6 +1355,11 @@ class Game:
         start_rect = start_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
         self.screen.blit(start_text, start_rect)
         
+        exit_text = self.small_font.render("Presiona ESC para salir", True, RED)
+        exit_rect = exit_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 100))
+        self.screen.blit(exit_text, exit_rect)
+
+
         scores_text = self.small_font.render("Presiona H para ver puntuaciones", True, WHITE)
         scores_rect = scores_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 40))
         self.screen.blit(scores_text, scores_rect)
@@ -1362,7 +1384,7 @@ class Game:
         title_rect = title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 150))
         self.screen.blit(title, title_rect)
         
-        mode1 = self.font.render("1 - ESCAPA", True, GREEN)
+        mode1 = self.font.render("1 - ESCAPA", True, NEON_TURQUOISE)
         mode1_rect = mode1.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 50))
         self.screen.blit(mode1, mode1_rect)
         
@@ -1573,7 +1595,7 @@ class Game:
         bar_y = y_offset
         pygame.draw.rect(self.screen, DARK_GRAY, (bar_x, bar_y, bar_width, bar_height))
         energy_width = int((self.player.energy / PLAYER_ENERGY_MAX) * bar_width)
-        energy_color = GREEN if self.player.energy > 30 else RED
+        energy_color = NEON_TURQUOISE if self.player.energy > 30 else RED
         pygame.draw.rect(self.screen, energy_color, (bar_x, bar_y, energy_width, bar_height))
         pygame.draw.rect(self.screen, WHITE, (bar_x, bar_y, bar_width, bar_height), 2)
         y_offset += 35
@@ -1599,7 +1621,7 @@ class Game:
             # Enemigos atrapados
             progress_text = self.small_font.render(
                 f"Atrapados: {self.enemies_captured}/{total_enemies}", 
-                True, GREEN)
+                True, NEON_TURQUOISE)
             self.screen.blit(progress_text, (10, y_offset))
             y_offset += 25
             
@@ -1613,7 +1635,7 @@ class Game:
             # Enemigos restantes
             remaining_text = self.small_font.render(
                 f"Restantes: {alive_enemies}", 
-                True, YELLOW if alive_enemies > 0 else GREEN)
+                True, YELLOW if alive_enemies > 0 else NEON_TURQUOISE)
             self.screen.blit(remaining_text, (10, y_offset))
             y_offset += 30
             
@@ -1679,6 +1701,25 @@ class Game:
         scores_text = self.small_font.render("Presiona H para ver puntuaciones", True, GRAY)
         scores_rect = scores_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 130))
         self.screen.blit(scores_text, scores_rect)
+
+    def draw_victory(self):
+        self.screen.fill(BLACK)
+        title = self.font.render("¡VICTORIA!", True, NEON_TURQUOISE)
+        title_rect = title.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 100))
+        self.screen.blit(title, title_rect)
+
+        reason = self.font.render("Has escapado exitosamente", True, WHITE)
+        reason_rect = reason.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 50))
+        self.screen.blit(reason, reason_rect)
+
+        score_text = self.font.render(f"Puntuación: {self.player.score}", True, YELLOW)
+        score_rect = score_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
+        self.screen.blit(score_text, score_rect)
+
+        continue_text = self.small_font.render("Presiona ENTER para continuar", True, WHITE)
+        continue_rect = continue_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 100))
+        self.screen.blit(continue_text, continue_rect)
+
     
     def draw_high_scores(self):
         """Dibuja la pantalla de puntuaciones altas"""
